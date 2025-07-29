@@ -246,6 +246,7 @@ find_package(Zydis 5.0.0 CONFIG)
 find_package(pugixml 1.14 CONFIG)
 if (APPLE)
     find_package(date 3.0.1 CONFIG)
+    find_package(epoll-shim 3.14 CONFIG)
 endif()
 list(POP_BACK CMAKE_MODULE_PATH)
 
@@ -892,6 +893,7 @@ set(SHADER_RECOMPILER src/shader_recompiler/exception.h
                       src/shader_recompiler/ir/attribute.h
                       src/shader_recompiler/ir/basic_block.cpp
                       src/shader_recompiler/ir/basic_block.h
+                      src/shader_recompiler/ir/breadth_first_search.h
                       src/shader_recompiler/ir/condition.h
                       src/shader_recompiler/ir/ir_emitter.cpp
                       src/shader_recompiler/ir/ir_emitter.h
@@ -1174,7 +1176,7 @@ if (APPLE)
     endif()
 
     # Replacement for std::chrono::time_zone
-    target_link_libraries(shadps4 PRIVATE date::date-tz)
+    target_link_libraries(shadps4 PRIVATE date::date-tz epoll-shim)
 endif()
 
 if (ENABLE_QT_GUI)
