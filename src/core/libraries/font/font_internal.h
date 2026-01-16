@@ -55,9 +55,6 @@ std::string DescribeValue(const T& value) {
     if constexpr (std::is_same_v<Clean, bool>) {
         return value ? "true" : "false";
     } else if constexpr (std::is_pointer_v<Clean>) {
-        if constexpr (std::is_same_v<Clean, const char*> || std::is_same_v<Clean, char*>) {
-            return value ? fmt::format("\"{}\"", value) : "(null)";
-        }
         return fmt::format("{}", reinterpret_cast<const void*>(value));
     } else if constexpr (std::is_floating_point_v<Clean>) {
         return fmt::format("{:.6g}", value);
@@ -200,6 +197,15 @@ struct GlyphEntry {
 };
 
 struct FontState {
+    // `scale_*` fields are controlled by style-state setters and are interpreted according to the
+    // style frame `scaleUnit` (pixel vs point). Public APIs accept codepoints as UTF-32 scalar
+    // values; glyph lookup and rendering uses FreeType + deterministic fallback selection.
+    //
+    // Fallback behavior (high level):
+    // - A font handle may have an external face (opened from file/memory) and, optionally, a
+    //   sysfont selection (font_set_type + primary sysfont + additional fallback sysfonts).
+    // - When a glyph is missing from the primary face, the implementation may consult the external
+    //   face and then the configured system fallback faces to preserve observable behavior.
     float scale_w = 16.0f;
     float scale_h = 16.0f;
     float scale_point_w = 12.0f;
@@ -696,6 +702,7 @@ extern u32 g_device_cache_stub;
 
 FontState& GetState(Libraries::Font::OrbisFontHandle h);
 FontState* TryGetState(Libraries::Font::OrbisFontHandle h);
+void RemoveState(Libraries::Font::OrbisFontHandle h);
 LibraryState& GetLibState(Libraries::Font::OrbisFontLib lib);
 void RemoveLibState(Libraries::Font::OrbisFontLib lib);
 FT_Face CreateFreeTypeFaceFromBytes(const unsigned char* data, std::size_t size, u32 subfont_index);
