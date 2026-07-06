@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <cstring>
 #include <span>
 #include <vector>
 #include <boost/container/static_vector.hpp>
@@ -157,7 +158,13 @@ struct Info : InfoPersistent {
 
     template <typename T>
     inline T ReadUdSharp(u32 sharp_idx) const noexcept {
-        return *reinterpret_cast<const T*>(&flattened_ud_buf[sharp_idx]);
+        const size_t byte_offset = size_t(sharp_idx) * sizeof(u32);
+        const size_t byte_count = flattened_ud_buf.size() * sizeof(u32);
+        ASSERT_MSG(byte_offset <= byte_count && sizeof(T) <= byte_count - byte_offset,
+                   "ReadUdSharp out of range idx={}", sharp_idx);
+        T data{};
+        std::memcpy(&data, flattened_ud_buf.data() + sharp_idx, sizeof(T));
+        return data;
     }
 
     template <typename T>

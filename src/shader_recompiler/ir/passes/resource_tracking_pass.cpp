@@ -1,6 +1,11 @@
 // SPDX-FileCopyrightText: Copyright 2024 shadPS4 Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <limits>
+#include <string>
+
+#include <fmt/format.h>
+
 #include "shader_recompiler/frontend/control_flow_graph.h"
 #include "shader_recompiler/info.h"
 #include "shader_recompiler/ir/basic_block.h"
@@ -363,89 +368,102 @@ std::pair<const IR::Inst*, bool> TryDisableAnisoLod0(const IR::Inst* inst) {
     return {prod2, true};
 }
 
-using SharpSources = boost::container::small_vector<const IR::Inst*, 4>;
-
 bool IsSharpSource(const IR::Inst* inst) {
     return inst->GetOpcode() == IR::Opcode::GetUserData ||
            inst->GetOpcode() == IR::Opcode::ReadConst;
 }
 
-SharpSources FindSharpSources(const IR::Inst* handle, u32 pc) {
-    SharpSources sources;
-    if (IsSharpSource(handle)) {
-        sources.push_back(handle);
-        return sources;
-    }
+SharpLocation SharpLocationFromSource(const IR::Inst* inst);
 
-    bool found_read_const_buffer = false;
+std::string DescribeSharpValue(const IR::Value& value);
 
-    boost::container::small_vector<const IR::Inst*, 8> visited;
-    std::queue<const IR::Inst*> queue;
-    queue.push(handle);
+std::string DescribeSharpGraph(const IR::Inst* inst) {
+    std::string out;
+    boost::container::small_vector<const IR::Inst*, 32> visited;
 
-    while (!queue.empty()) {
-        const IR::Inst* inst{queue.front()};
-        queue.pop();
-        if (IsSharpSource(inst)) {
-            sources.push_back(inst);
-            continue;
+    const auto visit = [&](const auto& self, const IR::Inst* node, u32 depth) -> void {
+        if (node == nullptr) {
+            out += fmt::format("{}<null>\n", std::string(depth * 2, ' '));
+            return;
         }
-        found_read_const_buffer |= inst->GetOpcode() == IR::Opcode::ReadConstBuffer;
-        if (inst->GetOpcode() != IR::Opcode::Phi) {
-            continue;
+        if (std::ranges::find(visited, node) != visited.end()) {
+            out += fmt::format("{}{} (seen)\n", std::string(depth * 2, ' '), node->GetOpcode());
+            return;
         }
-        for (size_t arg = inst->NumArgs(); arg--;) {
-            const IR::Value arg_value = inst->Arg(arg);
-            if (arg_value.IsImmediate()) {
-                continue;
+        visited.push_back(node);
+
+        out += fmt::format("{}{}\n", std::string(depth * 2, ' '), node->GetOpcode());
+        if (depth >= 10 || node->NumArgs() == 0) {
+            return;
+        }
+
+        for (size_t i = 0; i < node->NumArgs(); ++i) {
+            out += fmt::format("{}arg{}: ", std::string(depth * 2, ' '), i);
+            const IR::Value arg = node->Arg(i);
+            if (arg.IsImmediate()) {
+                out += fmt::format("#{}\n", arg.U32());
+            } else {
+                out += "\n";
+                self(self, arg.TryInstRecursive(), depth + 1);
             }
-            const IR::Inst* arg_inst = arg_value.InstRecursive();
-            if (std::ranges::find(visited, arg_inst) == visited.end()) {
-                visited.push_back(arg_inst);
-                queue.push(arg_inst);
-            }
         }
-    }
-    if (sources.empty()) {
-        if (found_read_const_buffer) {
-            UNREACHABLE_MSG("Bindless sharp access detected pc={:#x}", pc);
-        } else {
-            UNREACHABLE_MSG("Unable to find sharp sources pc={:#x}", pc);
-        }
-    }
-    return sources;
+    };
+
+    visit(visit, inst, 0);
+    return out;
 }
 
-bool IsCfgBlockDominatedBy(const Shader::Gcn::Block* maybe_dominator,
-                           const Shader::Gcn::Block* block, const Shader::Gcn::Block* dest_block) {
-    if (block == maybe_dominator) {
-        return true;
+std::string DescribeSharpValue(const IR::Value& value) {
+    if (value.IsImmediate()) {
+        return fmt::format("#{}", value.U32());
     }
+    return DescribeSharpGraph(value.TryInstRecursive());
+}
 
-    boost::container::small_vector<const Shader::Gcn::Block*, 8> visited;
-    std::queue<const Shader::Gcn::Block*> queue;
-    queue.push(block);
+std::optional<SharpLocation> TryResolveSharpConstant(const IR::Inst* inst) {
+    boost::container::small_vector<const IR::Inst*, 32> visited;
+    boost::container::small_vector<const IR::Inst*, 32> pending;
+    pending.push_back(inst);
 
-    while (!queue.empty()) {
-        const Shader::Gcn::Block* block{queue.front()};
-        queue.pop();
-        if (block == dest_block) {
-            return false;
-        }
-        if (block == maybe_dominator) {
+    std::optional<SharpLocation> result;
+    while (!pending.empty()) {
+        const IR::Inst* node = pending.back();
+        pending.pop_back();
+        if (node == nullptr || std::ranges::find(visited, node) != visited.end()) {
             continue;
         }
-        if (block->branch_false && !std::ranges::contains(visited, block->branch_false)) {
-            visited.push_back(block->branch_false);
-            queue.push(block->branch_false);
+        visited.push_back(node);
+
+        switch (node->GetOpcode()) {
+        case IR::Opcode::GetUserData:
+        case IR::Opcode::ReadConst: {
+            const SharpLocation sharp = SharpLocationFromSource(node);
+            if (result && *result != sharp) {
+                return std::nullopt;
+            }
+            result = sharp;
+            break;
         }
-        if (block->branch_true && !std::ranges::contains(visited, block->branch_true)) {
-            visited.push_back(block->branch_true);
-            queue.push(block->branch_true);
+        case IR::Opcode::Phi:
+            for (size_t arg = 0; arg < node->NumArgs(); ++arg) {
+                const IR::Value value{node->Arg(arg)};
+                if (value.IsImmediate()) {
+                    const SharpLocation sharp = value.U32();
+                    if (result && *result != sharp) {
+                        return std::nullopt;
+                    }
+                    result = sharp;
+                    continue;
+                }
+                pending.push_back(value.TryInstRecursive());
+            }
+            break;
+        default:
+            return std::nullopt;
         }
     }
 
-    return true;
+    return result;
 }
 
 SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
@@ -456,38 +474,51 @@ SharpLocation SharpLocationFromSource(const IR::Inst* inst) {
     }
 }
 
-SharpLocation TrackSharp(const IR::Inst* inst, const IR::Block& current_parent, u32 pc = 0) {
-    auto sources = FindSharpSources(inst, pc);
-    size_t num_sources = sources.size();
-    ASSERT(current_parent.cfg_block);
-
-    // Perform dominance analysis on found sources and eliminate ones that don't pass
-    // If a sharp source is dominated by another, the former can be eliminated.
-    for (s32 i = 0; i < num_sources;) {
-        const IR::Block* block = sources[i]->GetParent();
-        ASSERT(block->cfg_block);
-        bool was_removed = false;
-        for (s32 j = 0; j < num_sources;) {
-            const IR::Block* dominator = sources[j]->GetParent();
-            ASSERT(dominator->cfg_block);
-            if (i != j && IsCfgBlockDominatedBy(dominator->cfg_block, block->cfg_block,
-                                                current_parent.cfg_block)) {
-                std::swap(sources[i], sources[num_sources - 1]);
-                --num_sources;
-                sources.pop_back();
-                was_removed = true;
-                break;
-            } else {
-                ++j;
-            }
+template <typename Visited>
+SharpLocation AttemptTrackSharp(const IR::Inst* inst, Visited& visited_insts) {
+    // Search until we find a potential sharp source.
+    const auto pred = [&visited_insts](const IR::Inst* inst) -> std::optional<const IR::Inst*> {
+        if (std::ranges::find(visited_insts, inst) != visited_insts.end()) {
+            return std::nullopt;
         }
-        if (!was_removed) {
-            ++i;
+        if (IsSharpSource(inst)) {
+            return inst;
+        }
+        return std::nullopt;
+    };
+
+    const auto result = IR::BreadthFirstSearch(inst, pred);
+    if (!result) {
+        if (const auto constant = TryResolveSharpConstant(inst)) {
+            return *constant;
         }
     }
+    ASSERT_MSG(result, "Unable to track sharp source graph:\n{}", DescribeSharpGraph(inst));
 
-    ASSERT_MSG(sources.size() == 1, "Unable to deduce sharp source");
-    return SharpLocationFromSource(sources[0]);
+    inst = result.value();
+    visited_insts.emplace_back(inst);
+    return SharpLocationFromSource(inst);
+}
+
+template <typename DataType>
+std::pair<SharpLocation, DataType> TrackSharp(const IR::Inst* inst, const Info& info) {
+    boost::container::small_vector<const IR::Inst*, 4> visited_insts{};
+    while (true) {
+        const auto prev_size = visited_insts.size();
+        const auto sharp = AttemptTrackSharp(inst, visited_insts);
+        if (const auto data = info.ReadUdSharp<DataType>(sharp); data.Valid()) {
+            return std::make_pair(sharp, data);
+        }
+        if (prev_size == visited_insts.size()) {
+            // No change in visited instructions, we've run out of paths.
+            UNREACHABLE_MSG("Unable to find valid sharp.");
+        }
+    }
+}
+
+SharpLocation TrackSharp(const IR::Inst* inst) {
+    boost::container::static_vector<const IR::Inst*, 1> visited_insts{};
+    return AttemptTrackSharp(inst, visited_insts);
 }
 
 void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& descriptors,
@@ -518,9 +549,7 @@ void PatchBufferSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors&
     } else {
         // Normal buffer resource.
         IR::Inst* buffer_handle = handle->Arg(0).InstRecursive();
-        const auto inst_info = inst.Flags<IR::BufferInstInfo>();
-        const auto sharp_idx = TrackSharp(buffer_handle, block, inst_info.pc);
-        const auto buffer = info.ReadUdSharp<AmdGpu::Buffer>(sharp_idx);
+        const auto [sharp_idx, buffer] = TrackSharp<AmdGpu::Buffer>(buffer_handle, info);
         buffer_binding = descriptors.Add(BufferResource{
             .sharp_idx = sharp_idx,
             .used_types = BufferDataType(inst, profile, buffer.GetNumberFmt()),
@@ -541,7 +570,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
     // Read image sharp.
     const auto inst_info = inst.Flags<IR::TextureInstInfo>();
     const IR::Inst* image_handle = inst.Arg(0).InstRecursive();
-    const auto tsharp = TrackSharp(image_handle, block, inst_info.pc);
+    const auto tsharp = TrackSharp(image_handle);
     const bool is_atomic = IsImageAtomicInstruction(inst);
     const bool is_written = inst.GetOpcode() == IR::Opcode::ImageWrite || is_atomic;
     const bool is_storage =
@@ -650,7 +679,7 @@ void PatchImageSharp(IR::Block& block, IR::Inst& inst, Info& info, Descriptors& 
             // Normal sampler resource.
             const auto& [sampler_handle, disable_aniso] =
                 TryDisableAnisoLod0(sampler->Arg(0).InstRecursive());
-            const auto ssharp = TrackSharp(sampler_handle, block, inst_info.pc);
+            const auto ssharp = TrackSharp(sampler_handle);
             sampler_binding = descriptors.Add(SamplerResource{
                 .sharp_idx = ssharp,
                 .is_inline_sampler = false,
