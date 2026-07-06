@@ -98,17 +98,27 @@ void Translator::V_INTERP_MOV_F32(const GcnInst& inst) {
     const IR::Attribute attrib = IR::Attribute::Param0 + attr_index;
     const auto& attr = runtime_info.fs_info.inputs[attr_index];
     auto& interp = info.fs_interpolation[attr_index];
-    ASSERT(attr.is_flat || inst.src[0].code == 2);
-    if (profile.supports_amd_shader_explicit_vertex_parameter ||
-        profile.supports_fragment_shader_barycentric) {
-        // VSRC 0=P10, 1=P20, 2=P0
-        interp.primary = Qualifier::PerVertex;
+    if (attr.IsDefault()) {
         SetDst(inst.dst[0],
-               ir.GetAttribute(attrib, inst.control.vintrp.chan, (inst.src[0].code + 1) % 3));
-    } else {
-        interp.primary = Qualifier::Flat;
-        SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
+               ir.Imm32(DefaultValTable[attr.default_value][inst.control.vintrp.chan]));
+        return;
     }
+    if (attr.is_flat) {
+        interp = {Qualifier::Flat, Qualifier::None};
+        SetDst(inst.dst[0], ir.GetAttribute(attrib, inst.control.vintrp.chan));
+        return;
+    }
+    ASSERT_MSG(profile.supports_amd_shader_explicit_vertex_parameter ||
+                   profile.supports_fragment_shader_barycentric,
+               "v_interp_mov_f32 requires per-vertex fragment input support");
+    static constexpr std::array<u32, 3> VsrcToVertexIndex{1u, 2u, 0u};
+    ASSERT_MSG(inst.src[0].code < VsrcToVertexIndex.size(),
+               "Invalid v_interp_mov_f32 source selector {}", inst.src[0].code);
+
+    // VSRC[1:0]: 0=P10, 1=P20, 2=P0
+    interp = {Qualifier::PerVertex, Qualifier::None};
+    SetDst(inst.dst[0],
+           ir.GetAttribute(attrib, inst.control.vintrp.chan, VsrcToVertexIndex[inst.src[0].code]));
 }
 
 } // namespace Shader::Gcn
