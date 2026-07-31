@@ -385,6 +385,11 @@ void Rasterizer::Finish() {
     scheduler.Finish();
 }
 
+void Rasterizer::SignalGpuCompletion(Common::UniqueFunction<void>&& callback) {
+    scheduler.DeferPriorityOperation(std::move(callback));
+    scheduler.Flush();
+}
+
 void Rasterizer::OnSubmit() {
     if (fault_process_pending) {
         fault_process_pending = false;

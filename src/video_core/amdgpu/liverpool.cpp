@@ -1145,14 +1145,34 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
+                // RELEASE_MEM is an end-of-pipe operation. Publishing its label before the
+                // recorded commands complete lets the guest recycle memory still in GPU use.
+                const PM4CmdReleaseMem release = *release_mem;
+                if (release.data_sel.Value() == DataSelect::GdsMemStore) {
+                    rasterizer->CopyBuffer(release.Address<VAddr>(), release.gds_index,
+                                           release.num_dw * sizeof(u32), false, true);
+                }
+                rasterizer->SignalGpuCompletion(
+                    [release, pipe_id = queue.pipe_id] {
+                        release.SignalFence(
+                            [pipe_id] {
+                                Platform::IrqC::Instance()->Signal(
+                                    static_cast<Platform::InterruptId>(pipe_id));
+                            },
+                            [](VAddr, u16, u16) {
+                                // GDS-to-memory copies are recorded before the timeline signal.
+                            });
+                    });
+            } else {
+                release_mem->SignalFence(
+                    [pipe_id = queue.pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [](VAddr, u16, u16) {
+                        UNREACHABLE_MSG("Cannot copy GDS without a rasterizer");
+                    });
             }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
-                });
             break;
         }
         case PM4ItOpcode::EventWrite: {
