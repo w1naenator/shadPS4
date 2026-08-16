@@ -149,6 +149,16 @@ Id EmitGetAttribute(EmitContext& ctx, IR::Attribute attr, u32 comp, u32 index) {
     }
 }
 
+Id EmitGetAttributeU1(EmitContext& ctx, IR::Attribute attr, u32 comp) {
+    ASSERT(comp == 0);
+    switch (attr) {
+    case IR::Attribute::IsFrontFace:
+        return ctx.OpLoad(ctx.U1[1], ctx.front_facing);
+    default:
+        UNREACHABLE_MSG("Unsupported U1 attribute {}", attr);
+    }
+}
+
 Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
     switch (attr) {
     case IR::Attribute::VertexId:
@@ -163,11 +173,8 @@ Id EmitGetAttributeU32(EmitContext& ctx, IR::Attribute attr, u32 comp) {
         return ctx.OpCompositeExtract(ctx.U32[1], ctx.OpLoad(ctx.U32[3], ctx.local_invocation_id),
                                       comp);
     case IR::Attribute::IsFrontFace:
-        // Liverpool exposes FRONT_FACE to a pixel shader as an f32 sign in a VGPR:
-        // +1.0 for a front-facing primitive and -1.0 for a back-facing primitive. Vector
-        // registers are represented as raw U32 bits in the IR, so preserve those float bits.
-        return ctx.OpSelect(ctx.U32[1], ctx.OpLoad(ctx.U1[1], ctx.front_facing),
-                            ctx.ConstU32(0x3f800000U), ctx.ConstU32(0xbf800000U));
+        return ctx.OpSelect(ctx.U32[1], ctx.OpLoad(ctx.U1[1], ctx.front_facing), ctx.u32_one_value,
+                            ctx.u32_zero_value);
     case IR::Attribute::SampleIndex:
         return ctx.OpLoad(ctx.U32[1], ctx.sample_index);
     case IR::Attribute::RenderTargetIndex:
