@@ -38,7 +38,8 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
       buffer_cache{instance, scheduler, runtime, liverpool_, texture_cache, page_manager},
       texture_cache{instance, scheduler, runtime, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool, buffer_cache.GetSparsePageShift()},
+      pipeline_cache{instance, scheduler, liverpool, buffer_cache,
+                     buffer_cache.GetSparsePageShift()},
       host_markers_enabled{EmulatorSettings.IsVkHostMarkersEnabled()},
       guest_markers_enabled{EmulatorSettings.IsVkGuestMarkersEnabled()} {
     if (!EmulatorSettings.IsNullGPU()) {
@@ -1216,6 +1217,15 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size, bool assume_locks) {
         return false;
     }
     buffer_cache.ReadMemory(addr, size, false, assume_locks);
+    return true;
+}
+
+bool Rasterizer::ReadGpuModifiedMemory(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size) || buffer_cache.IsRegionCpuModified(addr, size) ||
+        !buffer_cache.IsRegionGpuModified(addr, size)) {
+        return false;
+    }
+    buffer_cache.ReadMemoryRange(addr, size);
     return true;
 }
 
