@@ -75,6 +75,65 @@ Liverpool::~Liverpool() {
     process_thread.join();
 }
 
+bool Liverpool::EnsureCommandBufferCoherent(const u32* address, u32 num_dwords) {
+    if (!rasterizer || !address || num_dwords == 0) {
+        return false;
+    }
+    return rasterizer->ReadGpuModifiedMemory(reinterpret_cast<VAddr>(address),
+                                             u64{num_dwords} * sizeof(u32));
+}
+
+bool Liverpool::IsPredicationSatisfied() const {
+    static constexpr u64 CounterValidMask = 1ULL << 63;
+    static constexpr u64 CounterValueMask = ~CounterValidMask;
+
+    switch (static_cast<PM4PredicationOp>(predication.operation)) {
+    case PM4PredicationOp::Clear:
+        return true;
+    case PM4PredicationOp::Zpass: {
+        const auto* results = reinterpret_cast<const u64*>(predication.address);
+        bool ready = true;
+        bool visible = false;
+        for (u32 i = 0; i < num_counter_pairs; ++i) {
+            const u64 begin = results[i * 2];
+            const u64 end = results[i * 2 + 1];
+            ready &= (begin & CounterValidMask) != 0 && (end & CounterValidMask) != 0;
+            visible |= (begin & CounterValueMask) != (end & CounterValueMask);
+        }
+        if (!ready) {
+            return predication.draw_if_not_ready;
+        }
+        return visible == predication.draw_if_visible;
+    }
+    case PM4PredicationOp::Boolean64:
+        return (*reinterpret_cast<const u64*>(predication.address) != 0) ==
+               predication.draw_if_visible;
+    case PM4PredicationOp::PrimCount:
+        LOG_WARNING(Render, "Unimplemented primitive-count predication");
+        return true;
+    }
+    UNREACHABLE_MSG("Unknown predication operation {}", predication.operation);
+}
+
+void Liverpool::ReserveCopyBufferSpace() {
+    auto& queue = mapped_queues[GfxQueueId];
+    std::scoped_lock lock{queue.m_access};
+    queue.copy_buffer_storage = std::make_shared<CopyBufferStorage>();
+}
+
+void Liverpool::SubmitDone() noexcept {
+    auto& queue = mapped_queues[GfxQueueId];
+    {
+        std::scoped_lock lock{queue.m_access};
+        queue.copy_buffer_storage.reset();
+    }
+    {
+        std::scoped_lock lock{submit_mutex};
+        submit_done = true;
+        submit_cv.notify_one();
+    }
+}
+
 void Liverpool::ProcessCommands() {
     // Process incoming commands with high priority
     while (num_commands) {
@@ -149,8 +208,12 @@ void Liverpool::Process(std::stop_token stoken) {
     }
 }
 
-Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb, bool is_indirect) {
     FIBER_ENTER(ccb_task_name);
+
+    if (is_indirect) {
+        EnsureCommandBufferCoherent(ccb.data(), static_cast<u32>(ccb.size()));
+    }
 
     while (!ccb.empty()) {
         ProcessCommands();
@@ -194,8 +257,8 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
         }
         case PM4ItOpcode::IndirectBufferConst: {
             const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
-            auto task =
-                ProcessCeUpdate({indirect_buffer->Address<const u32>(), indirect_buffer->ib_size});
+            auto task = ProcessCeUpdate(
+                {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, true);
             RESUME_CE(task);
 
             while (!task.handle.done()) {
@@ -215,19 +278,29 @@ Liverpool::Task Liverpool::ProcessCeUpdate(std::span<const u32> ccb) {
     FIBER_EXIT;
 }
 
-Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb) {
+Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                                           Task* inherited_ce_task,
+                                           std::shared_ptr<CopyBufferStorage> buffer_storage,
+                                           bool is_indirect) {
     FIBER_ENTER(dcb_task_name);
 
-    cblock.Reset();
+    if (is_indirect) {
+        EnsureCommandBufferCoherent(dcb.data(), static_cast<u32>(dcb.size()));
+    }
 
-    // TODO: potentially, ASCs also can depend on CE and in this case the
-    // CE task should be moved into more global scope
-    Task ce_task{};
+    // Indirect DCBs execute in their parent's hardware context and therefore share CE/DE state.
+    Task local_ce_task{};
+    const bool owns_ce_task = inherited_ce_task == nullptr;
+    Task* ce_task = owns_ce_task ? &local_ce_task : inherited_ce_task;
 
-    if (!ccb.empty()) {
+    if (owns_ce_task) {
+        cblock.Reset();
+    }
+
+    if (owns_ce_task && !ccb.empty()) {
         // In case of CCB provided kick off CE asap to have the constant heap ready to use
-        ce_task = ProcessCeUpdate(ccb);
-        RESUME_GFX(ce_task);
+        *ce_task = ProcessCeUpdate(ccb);
+        RESUME_GFX((*ce_task));
     }
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
     const bool guest_markers_enabled = rasterizer && EmulatorSettings.IsVkGuestMarkersEnabled();
@@ -254,6 +327,10 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         case 3:
             const u32 count = header->type3.NumWords();
             const PM4ItOpcode opcode = header->type3.opcode;
+            if (header->type3.predicate == PM4Predicate::PredEnable && !IsPredicationSatisfied()) {
+                dcb = NextPacket(dcb, count + 1);
+                continue;
+            }
             switch (opcode) {
             case PM4ItOpcode::Nop: {
                 const auto* nop = reinterpret_cast<const PM4CmdNop*>(header);
@@ -409,7 +486,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                const auto* set_predication = reinterpret_cast<const PM4CmdSetPredication*>(header);
+                predication.address = set_predication->Address();
+                predication.operation = static_cast<u32>(set_predication->pred_op.Value());
+                predication.draw_if_visible = set_predication->predication_boolean != 0;
+                predication.draw_if_not_ready = set_predication->hint != 0;
+                predication.continuation = set_predication->continue_bit != 0;
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -694,12 +776,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
                 }
-                event_eos->SignalFence([](void* address, u64 data, u32 num_bytes) {
-                    auto* memory = Core::Memory::Instance();
-                    if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                        memcpy(address, &data, num_bytes);
-                    }
-                });
+                const auto write_mem = [](void* address, u64 data, u32 num_bytes) {
+                    Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                };
                 if (event_eos->command == PM4CmdEventWriteEos::Command::GdsStore) {
                     ASSERT(event_eos->size == 1);
                     if (rasterizer) {
@@ -707,22 +786,33 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                         const u32 value = rasterizer->ReadDataFromGds(event_eos->gds_index);
                         *event_eos->Address() = value;
                     }
+                } else if (rasterizer) {
+                    const auto event = *event_eos;
+                    rasterizer->SignalGpuCompletion(
+                        [event, write_mem] { event.SignalFence(write_mem); });
+                } else {
+                    event_eos->SignalFence(write_mem);
                 }
                 break;
             }
             case PM4ItOpcode::EventWriteEop: {
-                const auto* event_eop = reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                const auto event = *reinterpret_cast<const PM4CmdEventWriteEop*>(header);
+                const auto signal = [event] {
+                    event.SignalFence(
+                        [](void* address, u64 data, u32 num_bytes) {
+                            Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                        },
+                        [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
+                };
                 if (rasterizer) {
                     rasterizer->ProcessDownloadImages();
+                    if (event.data_sel.Value() != DataSelect::None ||
+                        event.int_sel.Value() != InterruptSelect::None) {
+                        rasterizer->SignalGpuCompletion(signal);
+                    }
+                } else {
+                    signal();
                 }
-                event_eop->SignalFence(
-                    [](void* address, u64 data, u32 num_bytes) {
-                        auto* memory = Core::Memory::Instance();
-                        if (!memory->TryWriteBacking(address, &data, num_bytes)) {
-                            memcpy(address, &data, num_bytes);
-                        }
-                    },
-                    [] { Platform::IrqC::Instance()->Signal(Platform::InterruptId::GfxEop); });
                 break;
             }
             case PM4ItOpcode::DmaData: {
@@ -830,7 +920,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
             case PM4ItOpcode::IndirectBuffer: {
                 const auto* indirect_buffer = reinterpret_cast<const PM4CmdIndirectBuffer*>(header);
                 auto task = ProcessGraphics(
-                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {});
+                    {indirect_buffer->Address<const u32>(), indirect_buffer->ib_size}, {}, ce_task,
+                    buffer_storage, true);
                 RESUME_GFX(task);
 
                 while (!task.handle.done()) {
@@ -844,8 +935,8 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break;
             }
             case PM4ItOpcode::WaitOnCeCounter: {
-                while (cblock.ce_count <= cblock.de_count && !ce_task.handle.done()) {
-                    RESUME_GFX(ce_task);
+                while (cblock.ce_count <= cblock.de_count && !ce_task->handle.done()) {
+                    RESUME_GFX((*ce_task));
                 }
                 break;
             }
@@ -891,11 +982,11 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
         }
     }
 
-    if (ce_task.handle) {
-        while (!ce_task.handle.done()) {
-            RESUME_GFX(ce_task);
+    if (owns_ce_task && ce_task->handle) {
+        while (!ce_task->handle.done()) {
+            RESUME_GFX((*ce_task));
         }
-        ce_task.handle.destroy();
+        ce_task->handle.destroy();
     }
 
     FIBER_EXIT;
@@ -904,6 +995,9 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
 template <bool is_indirect>
 Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_ENTER(acb_task_name[vqid]);
+    if constexpr (is_indirect) {
+        EnsureCommandBufferCoherent(acb.data(), static_cast<u32>(acb.size()));
+    }
     auto& queue = asc_queues[{vqid}];
     const bool host_markers_enabled = rasterizer && EmulatorSettings.IsVkHostMarkersEnabled();
 
@@ -1145,14 +1239,35 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
             const auto* release_mem = reinterpret_cast<const PM4CmdReleaseMem*>(header);
             if (rasterizer) {
                 rasterizer->ProcessDownloadImages();
-            }
-            release_mem->SignalFence(
-                [pipe_id = queue.pipe_id] {
-                    Platform::IrqC::Instance()->Signal(static_cast<Platform::InterruptId>(pipe_id));
-                },
-                [this](VAddr dst, u16 gds_index, u16 num_dwords) {
-                    rasterizer->CopyBuffer(dst, gds_index, num_dwords * sizeof(u32), false, true);
+                const PM4CmdReleaseMem release = *release_mem;
+                if (release.data_sel.Value() == DataSelect::GdsMemStore) {
+                    rasterizer->CopyBuffer(release.Address<VAddr>(), release.gds_index,
+                                           release.num_dw * sizeof(u32), false, true);
+                }
+                rasterizer->SignalGpuCompletion([release, pipe_id = queue.pipe_id] {
+                    release.SignalFence(
+                        [pipe_id] {
+                            Platform::IrqC::Instance()->Signal(
+                                static_cast<Platform::InterruptId>(pipe_id));
+                        },
+                        [](VAddr, u16, u16) {},
+                        [](void* address, u64 data, u32 num_bytes) {
+                            Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                        });
                 });
+            } else {
+                release_mem->SignalFence(
+                    [pipe_id = queue.pipe_id] {
+                        Platform::IrqC::Instance()->Signal(
+                            static_cast<Platform::InterruptId>(pipe_id));
+                    },
+                    [](VAddr, u16, u16) {
+                        UNREACHABLE_MSG("Cannot copy GDS without a rasterizer");
+                    },
+                    [](void* address, u64 data, u32 num_bytes) {
+                        Core::Memory::Instance()->TryWriteBacking(address, &data, num_bytes);
+                    });
+            }
             break;
         }
         case PM4ItOpcode::EventWrite: {
@@ -1175,49 +1290,35 @@ Liverpool::Task Liverpool::ProcessCompute(std::span<const u32> acb, u32 vqid) {
     FIBER_EXIT;
 }
 
-Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb) {
-    auto& queue = mapped_queues[GfxQueueId];
-    ASSERT_MSG(queue.dcb_buffer.capacity() >= queue.dcb_buffer_offset + dcb.size(),
-               "dcb copy buffer out of reserved space");
-    ASSERT_MSG(queue.ccb_buffer.capacity() >= queue.ccb_buffer_offset + ccb.size(),
-               "ccb copy buffer out of reserved space");
-
-    queue.dcb_buffer.resize(
-        std::max(queue.dcb_buffer.size(), queue.dcb_buffer_offset + dcb.size()));
-    queue.ccb_buffer.resize(
-        std::max(queue.ccb_buffer.size(), queue.ccb_buffer_offset + ccb.size()));
-
-    const u32 prev_dcb_buffer_offset = queue.dcb_buffer_offset;
-    const u32 prev_ccb_buffer_offset = queue.ccb_buffer_offset;
-    if (!dcb.empty()) {
-        std::memcpy(queue.dcb_buffer.data() + queue.dcb_buffer_offset, dcb.data(),
-                    dcb.size_bytes());
-        queue.dcb_buffer_offset += dcb.size();
-        dcb = std::span<const u32>{queue.dcb_buffer.begin() + prev_dcb_buffer_offset,
-                                   queue.dcb_buffer.begin() + queue.dcb_buffer_offset};
-    }
-
-    if (!ccb.empty()) {
-        std::memcpy(queue.ccb_buffer.data() + queue.ccb_buffer_offset, ccb.data(),
-                    ccb.size_bytes());
-        queue.ccb_buffer_offset += ccb.size();
-        ccb = std::span<const u32>{queue.ccb_buffer.begin() + prev_ccb_buffer_offset,
-                                   queue.ccb_buffer.begin() + queue.ccb_buffer_offset};
-    }
-
-    return std::make_pair(dcb, ccb);
+Liverpool::CmdBuffer Liverpool::CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb,
+                                               CopyBufferStorage& storage) {
+    const auto copy_buffer = [&storage](std::span<const u32> source) -> std::span<const u32> {
+        if (source.empty()) {
+            return {};
+        }
+        auto allocation = std::make_unique_for_overwrite<u32[]>(source.size());
+        u32* const copy = allocation.get();
+        std::memcpy(copy, source.data(), source.size_bytes());
+        storage.allocations.emplace_back(std::move(allocation));
+        return {copy, source.size()};
+    };
+    return {copy_buffer(dcb), copy_buffer(ccb)};
 }
 
 void Liverpool::SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb) {
     auto& queue = mapped_queues[GfxQueueId];
-
-    if (EmulatorSettings.IsCopyGpuBuffers()) {
-        std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb);
-    }
-
-    auto task = ProcessGraphics(dcb, ccb);
     {
         std::scoped_lock lock{queue.m_access};
+        std::shared_ptr<CopyBufferStorage> buffer_storage;
+        if (EmulatorSettings.IsCopyGpuBuffers()) {
+            if (!queue.copy_buffer_storage) {
+                queue.copy_buffer_storage = std::make_shared<CopyBufferStorage>();
+            }
+            buffer_storage = queue.copy_buffer_storage;
+            std::tie(dcb, ccb) = CopyCmdBuffers(dcb, ccb, *buffer_storage);
+        }
+
+        auto task = ProcessGraphics(dcb, ccb, nullptr, std::move(buffer_storage));
         queue.submits.emplace(task.handle);
     }
 

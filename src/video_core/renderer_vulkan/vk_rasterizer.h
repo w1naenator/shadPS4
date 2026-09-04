@@ -5,6 +5,7 @@
 
 #include "common/recursive_lock.h"
 #include "common/shared_first_mutex.h"
+#include "common/unique_function.h"
 #include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/page_manager.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
@@ -60,6 +61,7 @@ public:
     u32 ReadDataFromGds(u32 gsd_offset);
     bool InvalidateMemory(VAddr addr, u64 size);
     bool ReadMemory(VAddr addr, u64 size);
+    bool ReadGpuModifiedMemory(VAddr addr, u64 size);
     void ProcessDownloadImages();
     bool IsMapped(VAddr addr, u64 size);
     void MapMemory(VAddr addr, u64 size);
@@ -68,6 +70,7 @@ public:
     void CpSync();
     u64 Flush();
     void Finish();
+    void SignalGpuCompletion(Common::UniqueFunction<void>&& callback);
     void OnSubmit();
 
     PipelineCache& GetPipelineCache() {

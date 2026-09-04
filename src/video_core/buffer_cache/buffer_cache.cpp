@@ -94,12 +94,27 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write) {
     });
 }
 
-template <bool async>
+void BufferCache::ReadMemoryRange(VAddr device_addr, u64 size) {
+    if (!gpu_modified_ranges.Intersects(device_addr, size)) {
+        return;
+    }
+    Buffer& buffer = slot_buffers[FindBuffer(device_addr, size)];
+    // Resolve newer CPU writes just as for any other GPU read of this buffer.
+    SynchronizeBuffer(buffer, device_addr, size, false, false);
+    DownloadBufferMemory<false, true>(buffer, device_addr, size);
+}
+
+template <bool async, bool exact>
 void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size) {
     boost::container::small_vector<vk::BufferCopy, 1> copies;
     u64 total_size_bytes = 0;
     memory_tracker->ForEachDownloadRange<false>(
         device_addr, size, [&](u64 device_addr_out, u64 range_size) {
+            if constexpr (exact) {
+                const VAddr end = std::min(device_addr_out + range_size, device_addr + size);
+                device_addr_out = std::max(device_addr_out, device_addr);
+                range_size = end - device_addr_out;
+            }
             const VAddr buffer_addr = buffer.CpuAddr();
             const auto add_download = [&](VAddr start, VAddr end) {
                 const u64 new_offset = start - buffer_addr;
@@ -152,7 +167,17 @@ void BufferCache::DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 si
             memory->TryWriteBacking(std::bit_cast<u8*>(copy_device_addr), download + dst_offset,
                                     copy.size);
         }
-        memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        if constexpr (exact) {
+            // A partial read must not clear tracking for other GPU writes on the same page.
+            for (VAddr page = Common::AlignDown(device_addr, TRACKER_BYTES_PER_PAGE);
+                 page < device_addr + size; page += TRACKER_BYTES_PER_PAGE) {
+                if (!gpu_modified_ranges.Intersects(page, TRACKER_BYTES_PER_PAGE)) {
+                    memory_tracker->UnmarkRegionAsGpuModified(page, TRACKER_BYTES_PER_PAGE);
+                }
+            }
+        } else {
+            memory_tracker->UnmarkRegionAsGpuModified(device_addr, size);
+        }
     };
     if constexpr (async) {
         scheduler.DeferOperation(write_data);

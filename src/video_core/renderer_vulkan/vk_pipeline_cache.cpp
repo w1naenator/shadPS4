@@ -13,6 +13,7 @@
 #include "shader_recompiler/recompiler.h"
 #include "shader_recompiler/runtime_info.h"
 #include "video_core/amdgpu/liverpool.h"
+#include "video_core/buffer_cache/buffer_cache.h"
 #include "video_core/cache_storage.h"
 #include "video_core/renderer_vulkan/liverpool_to_vk.h"
 #include "video_core/renderer_vulkan/vk_instance.h"
@@ -180,6 +181,7 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
         gs_info.in_vertex_data_size = regs.vgt_esgs_ring_itemsize;
         gs_info.out_vertex_data_size = regs.vgt_gs_vert_itemsize[0];
         gs_info.mode = regs.vgt_gs_mode.mode;
+        SynchronizeShaderCode(regs.vs_program.Address<VAddr>());
         const auto params_vc = AmdGpu::GetParams(regs.vs_program);
         gs_info.vs_copy = params_vc.code;
         gs_info.vs_copy_hash = params_vc.hash;
@@ -254,8 +256,9 @@ const Shader::RuntimeInfo& PipelineCache::BuildRuntimeInfo(Stage stage, LogicalS
 }
 
 PipelineCache::PipelineCache(const Instance& instance_, Scheduler& scheduler_,
-                             AmdGpu::Liverpool* liverpool_)
+                             AmdGpu::Liverpool* liverpool_, VideoCore::BufferCache& buffer_cache_)
     : instance{instance_}, scheduler{scheduler_}, liverpool{liverpool_},
+      buffer_cache{buffer_cache_},
       desc_heap{instance, scheduler.GetMasterSemaphore(), DescriptorHeapSizes} {
     const auto& vk12_props = instance.GetVk12Properties();
     profile = Shader::Profile{
@@ -497,6 +500,7 @@ bool PipelineCache::RefreshGraphicsStages() {
             return false;
         }
 
+        SynchronizeShaderCode(pgm->Address<VAddr>());
         const auto params = AmdGpu::GetParams(*pgm);
         std::optional<Shader::Gcn::FetchShaderData> fetch_shader_;
         std::tie(infos[stage_out_idx], modules[stage_out_idx], fetch_shader_,
@@ -598,9 +602,28 @@ bool PipelineCache::RefreshGraphicsStages() {
     return true;
 }
 
+void PipelineCache::SynchronizeShaderCode(VAddr address) {
+    // The host recompiler consumes shader code through the CPU mapping, including shaders
+    // generated or relocated by the guest GPU. This is independent of guest CPU readbacks.
+    buffer_cache.ReadMemoryRange(address, 2 * sizeof(u32));
+    const auto* code = reinterpret_cast<const u32*>(address);
+    if (code[0] == 0xbeeb03ff) {
+        const VAddr info_address = address + (u64{code[1]} + 1) * 2 * sizeof(u32);
+        buffer_cache.ReadMemoryRange(info_address, sizeof(AmdGpu::BinaryInfo));
+        const auto& info = *reinterpret_cast<const AmdGpu::BinaryInfo*>(info_address);
+        if (info.Valid()) {
+            buffer_cache.ReadMemoryRange(address, info.length);
+            return;
+        }
+    }
+    // Match SearchBinaryInfo's search window for shaders without the standard prologue.
+    buffer_cache.ReadMemoryRange(address, 0x4000 * sizeof(u32));
+}
+
 bool PipelineCache::RefreshComputeKey() {
     Shader::Backend::Bindings binding{};
     const auto& cs_pgm = liverpool->GetCsRegs();
+    SynchronizeShaderCode(cs_pgm.Address<VAddr>());
     const auto cs_params = AmdGpu::GetParams(cs_pgm);
     std::tie(infos[0], modules[0], fetch_shader, compute_key.value) =
         GetProgram(Shader::Stage::Compute, LogicalStage::Compute, cs_params, binding);

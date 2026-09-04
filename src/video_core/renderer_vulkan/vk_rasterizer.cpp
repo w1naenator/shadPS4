@@ -38,7 +38,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_,
       buffer_cache{instance, scheduler, liverpool_, texture_cache, page_manager},
       texture_cache{instance, scheduler, liverpool_, buffer_cache, page_manager},
       liverpool{liverpool_}, memory{Core::Memory::Instance()},
-      pipeline_cache{instance, scheduler, liverpool} {
+      pipeline_cache{instance, scheduler, liverpool, buffer_cache} {
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -389,6 +389,11 @@ u64 Rasterizer::Flush() {
 
 void Rasterizer::Finish() {
     scheduler.Finish();
+}
+
+void Rasterizer::SignalGpuCompletion(Common::UniqueFunction<void>&& callback) {
+    scheduler.DeferPriorityOperation(std::move(callback));
+    scheduler.Flush();
 }
 
 void Rasterizer::OnSubmit() {
@@ -1097,6 +1102,15 @@ bool Rasterizer::ReadMemory(VAddr addr, u64 size) {
         return false;
     }
     buffer_cache.ReadMemory(addr, size);
+    return true;
+}
+
+bool Rasterizer::ReadGpuModifiedMemory(VAddr addr, u64 size) {
+    if (!IsMapped(addr, size) || buffer_cache.IsRegionCpuModified(addr, size) ||
+        !buffer_cache.IsRegionGpuModified(addr, size)) {
+        return false;
+    }
+    buffer_cache.ReadMemoryRange(addr, size);
     return true;
 }
 

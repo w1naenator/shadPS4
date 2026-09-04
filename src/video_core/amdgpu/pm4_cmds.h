@@ -110,6 +110,32 @@ struct PM4CmdContextControl {
     ContextControlEnable shadow_enable; ///< Enable bits for shadowing
 };
 
+enum class PM4PredicationOp : u32 {
+    Clear = 0,
+    Zpass = 1,
+    PrimCount = 2,
+    Boolean64 = 3,
+};
+
+struct PM4CmdSetPredication {
+    PM4Type3Header header;
+    u32 start_address_lo;
+    union {
+        u32 control;
+        BitField<0, 8, u32> start_address_hi;
+        BitField<8, 1, u32> predication_boolean;
+        BitField<12, 1, u32> hint;
+        BitField<16, 3, PM4PredicationOp> pred_op;
+        BitField<31, 1, u32> continue_bit;
+    };
+
+    template <typename T = VAddr>
+    T Address() const {
+        return reinterpret_cast<T>((u64{start_address_hi} << 32) | start_address_lo);
+    }
+};
+static_assert(sizeof(PM4CmdSetPredication) == 3 * sizeof(u32));
+
 union LoadAddressHigh {
     u32 raw;
     BitField<0, 16, u32>
@@ -934,22 +960,22 @@ struct PM4CmdReleaseMem {
         return data_lo | u64(data_hi) << 32;
     }
 
-    void SignalFence(auto&& signal_irq, auto&& gds_to_mem) const {
+    void SignalFence(auto&& signal_irq, auto&& gds_to_mem, auto&& write_mem) const {
         switch (data_sel.Value()) {
         case DataSelect::Data32Low: {
-            *Address<u32*>() = DataDWord();
+            write_mem(Address<void*>(), DataDWord(), sizeof(u32));
             break;
         }
         case DataSelect::Data64: {
-            *Address<u64*>() = DataQWord();
+            write_mem(Address<void*>(), DataQWord(), sizeof(u64));
             break;
         }
         case DataSelect::GpuClock64: {
-            *Address<u64*>() = GetGpuClock64();
+            write_mem(Address<void*>(), GetGpuClock64(), sizeof(u64));
             break;
         }
         case DataSelect::PerfCounter: {
-            *Address<u64*>() = GetGpuPerfCounter();
+            write_mem(Address<void*>(), GetGpuPerfCounter(), sizeof(u64));
             break;
         }
         case DataSelect::GdsMemStore: {

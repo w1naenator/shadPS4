@@ -167,8 +167,24 @@ void MemoryManager::CopySparseMemory(VAddr virtual_addr, u8* dest, u64 size) {
 bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     const VAddr virtual_addr = std::bit_cast<VAddr>(address);
     std::shared_lock lk{mutex};
-    ASSERT_MSG(IsValidMapping(virtual_addr, size), "Attempted to access invalid address {:#x}",
-               virtual_addr);
+    if (!IsValidMapping(virtual_addr, size)) {
+        return false;
+    }
+
+    auto mapped_vma = FindVMA(virtual_addr);
+    VAddr mapped_addr = virtual_addr;
+    u64 mapped_size = size;
+    while (mapped_size > 0) {
+        if (mapped_vma == vma_map.end() || !mapped_vma->second.IsMapped() ||
+            !mapped_vma->second.Contains(mapped_addr, 0)) {
+            return false;
+        }
+        const u64 size_in_vma =
+            std::min(mapped_size, mapped_vma->second.base + mapped_vma->second.size - mapped_addr);
+        mapped_addr += size_in_vma;
+        mapped_size -= size_in_vma;
+        ++mapped_vma;
+    }
 
     std::vector<VirtualMemoryArea> vmas_to_write;
     auto current_vma = FindVMA(virtual_addr);
@@ -181,7 +197,8 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
     }
 
     if (vmas_to_write.empty()) {
-        return false;
+        memcpy(address, data, size);
+        return true;
     }
 
     for (auto& vma : vmas_to_write) {
@@ -197,6 +214,7 @@ bool MemoryManager::TryWriteBacking(void* address, const void* data, u64 size) {
             u64 copy_size = std::min<u64>(size, phys_handle->second.size - start_in_dma);
             memcpy(backing, data, copy_size);
             size -= copy_size;
+            data = static_cast<const u8*>(data) + copy_size;
         }
     }
 

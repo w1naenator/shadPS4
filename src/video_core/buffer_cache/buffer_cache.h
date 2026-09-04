@@ -109,6 +109,9 @@ public:
     /// Flushes any GPU modified buffer in the logical page range back to CPU memory.
     void ReadMemory(VAddr device_addr, u64 size, bool is_write = false);
 
+    /// Synchronizes only the requested GPU-written bytes for CPU-side GPU consumers.
+    void ReadMemoryRange(VAddr device_addr, u64 size);
+
     /// Binds host vertex buffers for the current draw.
     void BindVertexBuffers(const Vulkan::GraphicsPipeline& pipeline,
                            boost::container::small_vector<vk::BufferMemoryBarrier2, 16>& barriers);
@@ -169,7 +172,7 @@ private:
         return !buffer_id || slot_buffers[buffer_id].is_deleted;
     }
 
-    template <bool async>
+    template <bool async, bool exact = false>
     void DownloadBufferMemory(Buffer& buffer, VAddr device_addr, u64 size);
 
     [[nodiscard]] OverlapResult ResolveOverlaps(VAddr device_addr, u32 wanted_size);

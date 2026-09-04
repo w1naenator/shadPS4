@@ -6,6 +6,7 @@
 #include <condition_variable>
 #include <coroutine>
 #include <exception>
+#include <memory>
 #include <mutex>
 #include <semaphore>
 #include <span>
@@ -70,13 +71,7 @@ public:
     void SubmitGfx(std::span<const u32> dcb, std::span<const u32> ccb);
     void SubmitAsc(u32 gnm_vqid, std::span<const u32> acb);
 
-    void SubmitDone() noexcept {
-        std::scoped_lock lk{submit_mutex};
-        mapped_queues[GfxQueueId].ccb_buffer_offset = 0;
-        mapped_queues[GfxQueueId].dcb_buffer_offset = 0;
-        submit_done = true;
-        submit_cv.notify_one();
-    }
+    void SubmitDone() noexcept;
 
     void WaitGpuIdle() noexcept {
         std::unique_lock lk{submit_mutex};
@@ -120,13 +115,7 @@ public:
         }
     }
 
-    void ReserveCopyBufferSpace() {
-        GpuQueue& gfx_queue = mapped_queues[GfxQueueId];
-        std::scoped_lock lk(gfx_queue.m_access);
-        constexpr size_t GfxReservedSize = 2_MB >> 2;
-        gfx_queue.ccb_buffer.reserve(GfxReservedSize);
-        gfx_queue.dcb_buffer.reserve(GfxReservedSize);
-    }
+    void ReserveCopyBufferSpace();
 
     inline ComputeProgram& GetCsRegs() {
         return mapped_queues[curr_qid].cs_state;
@@ -144,6 +133,10 @@ public:
     Common::SlotVector<AscQueueInfo> asc_queues{};
 
 private:
+    struct CopyBufferStorage {
+        std::vector<std::unique_ptr<u32[]>> allocations;
+    };
+
     struct Task {
         struct promise_type {
             auto get_return_object() {
@@ -177,21 +170,25 @@ private:
     };
 
     using CmdBuffer = std::pair<std::span<const u32>, std::span<const u32>>;
-    CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb);
-    Task ProcessCeUpdate(std::span<const u32> ccb);
+    CmdBuffer CopyCmdBuffers(std::span<const u32> dcb, std::span<const u32> ccb,
+                             CopyBufferStorage& storage);
+    Task ProcessGraphics(std::span<const u32> dcb, std::span<const u32> ccb,
+                         Task* inherited_ce_task = nullptr,
+                         std::shared_ptr<CopyBufferStorage> buffer_storage = {},
+                         bool is_indirect = false);
+    Task ProcessCeUpdate(std::span<const u32> ccb, bool is_indirect = false);
     template <bool is_indirect = false>
     Task ProcessCompute(std::span<const u32> acb, u32 vqid);
+
+    bool EnsureCommandBufferCoherent(const u32* address, u32 num_dwords);
+    bool IsPredicationSatisfied() const;
 
     void ProcessCommands();
     void Process(std::stop_token stoken);
 
     struct GpuQueue {
         std::mutex m_access{};
-        std::atomic<u32> dcb_buffer_offset;
-        std::atomic<u32> ccb_buffer_offset;
-        std::vector<u32> dcb_buffer;
-        std::vector<u32> ccb_buffer;
+        std::shared_ptr<CopyBufferStorage> copy_buffer_storage;
         std::queue<Task::Handle> submits{};
         ComputeProgram cs_state{};
     };
@@ -201,6 +198,14 @@ private:
     VAddr indirect_args_addr{};
     u32 num_counter_pairs{};
     u64 pixel_counter{};
+
+    struct PredicationState {
+        VAddr address{};
+        u32 operation{};
+        bool draw_if_visible{};
+        bool draw_if_not_ready{};
+        bool continuation{};
+    } predication{};
 
     struct ConstantEngine {
         void Reset() {

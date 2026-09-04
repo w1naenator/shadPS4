@@ -27,6 +27,10 @@ namespace Serialization {
 struct Archive;
 }
 
+namespace VideoCore {
+class BufferCache;
+}
+
 namespace Shader {
 struct Info;
 }
@@ -66,7 +70,7 @@ struct Program {
 class PipelineCache {
 public:
     explicit PipelineCache(const Instance& instance, Scheduler& scheduler,
-                           AmdGpu::Liverpool* liverpool);
+                           AmdGpu::Liverpool* liverpool, VideoCore::BufferCache& buffer_cache);
     ~PipelineCache();
 
     void WarmUp();
@@ -99,6 +103,7 @@ private:
     bool RefreshGraphicsKey();
     bool RefreshGraphicsStages();
     bool RefreshComputeKey();
+    void SynchronizeShaderCode(VAddr address);
 
     void DumpShader(std::span<const u32> code, u64 hash, Shader::Stage stage, size_t perm_idx,
                     std::string_view ext);
@@ -117,6 +122,7 @@ private:
     const Instance& instance;
     Scheduler& scheduler;
     AmdGpu::Liverpool* liverpool;
+    VideoCore::BufferCache& buffer_cache;
     DescriptorHeap desc_heap;
     vk::UniquePipelineCache pipeline_cache;
     vk::UniquePipelineLayout pipeline_layout;
