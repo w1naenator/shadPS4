@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <cmath>
-#include <optional>
 #include <unordered_map>
 
 #include <gtest/gtest.h>
@@ -12,7 +11,6 @@
 
 #include "gcn_test_runner.hpp"
 #include "instructions.hpp"
-#include "shader_recompiler/fragment_barycentric.h"
 #include "shader_recompiler/frontend/translate/translate.h"
 #include "shader_recompiler/profile.h"
 #include "shader_recompiler/recompiler.h"
@@ -38,23 +36,9 @@ struct F32x2 {
 
 namespace {
 
-struct InterpMovIr {
-    std::vector<u32> attribute_vertex_indices;
-    std::optional<std::pair<u32, u32>> subtraction_vertex_indices;
-    Shader::Qualifier qualifier;
-};
-
-struct InterpStageIr {
-    std::vector<u32> attribute_vertex_indices;
-    u32 fma_count{};
-    u32 destination_write_count{};
-    Shader::Qualifier qualifier;
-};
-
 struct SpirvFacts {
     std::unordered_map<u32, u32> capabilities;
     std::unordered_map<u32, u32> builtins;
-    std::unordered_map<u32, u32> decorations;
     std::unordered_map<u32, u32> opcodes;
     std::unordered_map<u32, u32> constant_words;
 
@@ -66,11 +50,6 @@ struct SpirvFacts {
     u32 CountBuiltin(spv::BuiltIn builtin) const {
         const auto it = builtins.find(static_cast<u32>(builtin));
         return it == builtins.end() ? 0U : it->second;
-    }
-
-    u32 CountDecoration(spv::Decoration decoration) const {
-        const auto it = decorations.find(static_cast<u32>(decoration));
-        return it == decorations.end() ? 0U : it->second;
     }
 
     u32 CountOpcode(spv::Op opcode) const {
@@ -104,7 +83,6 @@ SpirvFacts InspectSpirv(std::span<const u32> spirv) {
             break;
         case spv::Op::OpDecorate:
             EXPECT_GE(word_count, 3U);
-            ++facts.decorations[spirv[offset + 2]];
             if (spirv[offset + 2] == static_cast<u32>(spv::Decoration::BuiltIn)) {
                 EXPECT_GE(word_count, 4U);
                 ++facts.builtins[spirv[offset + 3]];
@@ -146,8 +124,12 @@ bool FragmentPrologueLoadsSampleCoverage(bool enabled) {
     });
 }
 
-InterpMovIr TranslateInterpMovToIr(u32 selector, bool supports_fragment_shader_barycentric = true,
-                                   bool is_flat = false) {
+struct InterpMovResult {
+    Shader::Qualifier qualifier{};
+    u32 vertex_index{};
+};
+
+InterpMovResult TranslateInterpMovToIr(u32 selector) {
     Shader::Pools pools;
     Shader::Info info{};
     info.stage = Shader::Stage::Fragment;
@@ -157,56 +139,6 @@ InterpMovIr TranslateInterpMovToIr(u32 selector, bool supports_fragment_shader_b
     runtime_info.Initialize(Shader::Stage::Fragment);
     runtime_info.fs_info.num_inputs = 1;
     runtime_info.fs_info.inputs[0].param_index = 0;
-    runtime_info.fs_info.inputs[0].is_flat = is_flat;
-
-    Shader::Profile profile{};
-    profile.supports_fragment_shader_barycentric = supports_fragment_shader_barycentric;
-
-    Shader::IR::Block block{pools.inst_pool};
-    Shader::Gcn::Translator translator{info, runtime_info, profile};
-    translator.EmitPrologue(&block);
-    const auto prologue_size = block.size();
-
-    Shader::Gcn::GcnInst inst{};
-    inst.src[0].code = selector;
-    inst.dst[0].field = Shader::Gcn::OperandField::VectorGPR;
-    inst.dst[0].code = 0;
-    inst.control.vintrp.attr = 0;
-    inst.control.vintrp.chan = 2;
-    translator.V_INTERP_MOV_F32(inst);
-
-    InterpMovIr result{.qualifier = info.fs_interpolation[0].primary};
-    auto it = block.begin();
-    std::advance(it, prologue_size);
-    for (; it != block.end(); ++it) {
-        if (it->GetOpcode() == Shader::IR::Opcode::GetAttribute) {
-            result.attribute_vertex_indices.push_back(it->Arg(2).U32());
-        } else if (it->GetOpcode() == Shader::IR::Opcode::FPSub32) {
-            const auto* lhs = it->Arg(0).Inst();
-            const auto* rhs = it->Arg(1).Inst();
-            if (lhs->GetOpcode() == Shader::IR::Opcode::GetAttribute &&
-                rhs->GetOpcode() == Shader::IR::Opcode::GetAttribute) {
-                result.subtraction_vertex_indices = {lhs->Arg(2).U32(), rhs->Arg(2).U32()};
-            }
-        }
-    }
-    return result;
-}
-
-InterpStageIr TranslateInterpStageToIr(bool second_phase, bool is_default = false,
-                                       bool is_flat = false) {
-    Shader::Pools pools;
-    Shader::Info info{};
-    info.stage = Shader::Stage::Fragment;
-    info.l_stage = Shader::LogicalStage::Fragment;
-
-    Shader::RuntimeInfo runtime_info{};
-    runtime_info.Initialize(Shader::Stage::Fragment);
-    runtime_info.fs_info.num_inputs = 1;
-    runtime_info.fs_info.inputs[0].param_index = 0;
-    runtime_info.fs_info.inputs[0].is_default = is_default;
-    runtime_info.fs_info.inputs[0].is_flat = is_flat;
-    runtime_info.fs_info.inputs[0].default_value = 3;
 
     Shader::Profile profile{};
     profile.supports_fragment_shader_barycentric = true;
@@ -214,52 +146,27 @@ InterpStageIr TranslateInterpStageToIr(bool second_phase, bool is_default = fals
     Shader::IR::Block block{pools.inst_pool};
     Shader::Gcn::Translator translator{info, runtime_info, profile};
     translator.EmitPrologue(&block);
-    const auto prologue_size = block.size();
-
     Shader::Gcn::GcnInst inst{};
-    inst.src[0].field = Shader::Gcn::OperandField::VectorGPR;
-    inst.src[0].code = 5;
+    inst.src[0].code = selector;
     inst.dst[0].field = Shader::Gcn::OperandField::VectorGPR;
-    inst.dst[0].code = 7;
+    inst.dst[0].code = 0;
     inst.control.vintrp.attr = 0;
-    inst.control.vintrp.chan = 0;
-    if (second_phase) {
-        translator.V_INTERP_P2_F32(inst);
-    } else {
-        translator.V_INTERP_P1_F32(inst);
-    }
+    translator.V_INTERP_MOV_F32(inst);
 
-    InterpStageIr result{.qualifier = info.fs_interpolation[0].primary};
-    auto it = block.begin();
-    std::advance(it, prologue_size);
-    for (; it != block.end(); ++it) {
-        switch (it->GetOpcode()) {
-        case Shader::IR::Opcode::GetAttribute:
-            result.attribute_vertex_indices.push_back(it->Arg(2).U32());
-            break;
-        case Shader::IR::Opcode::FPFma32:
-            ++result.fma_count;
-            break;
-        case Shader::IR::Opcode::SetVectorRegister:
-            ++result.destination_write_count;
-            break;
-        default:
-            break;
-        }
-    }
-    return result;
+    const auto attr = std::ranges::find_if(block, [](const Shader::IR::Inst& inst) {
+        return inst.GetOpcode() == Shader::IR::Opcode::GetAttribute;
+    });
+    EXPECT_NE(attr, block.end());
+    return {
+        .qualifier = info.fs_interpolation[0].primary,
+        .vertex_index = attr == block.end() ? 0U : attr->Arg(2).U32(),
+    };
 }
 
-Shader::RuntimeInfo BarycentricRuntimeInfo() {
+Shader::RuntimeInfo PullModelRuntimeInfo() {
     Shader::RuntimeInfo runtime_info{};
     runtime_info.Initialize(Shader::Stage::Fragment);
-    runtime_info.fs_info.addr_flags.persp_sample_ena = 1;
-    runtime_info.fs_info.addr_flags.persp_center_ena = 1;
-    runtime_info.fs_info.addr_flags.persp_centroid_ena = 1;
     runtime_info.fs_info.addr_flags.persp_pull_model_ena = 1;
-    runtime_info.fs_info.addr_flags.linear_sample_ena = 1;
-    runtime_info.fs_info.addr_flags.linear_center_ena = 1;
-    runtime_info.fs_info.addr_flags.linear_centroid_ena = 1;
     runtime_info.fs_info.color_buffers[0].num_format = AmdGpu::NumberFormat::Float;
     return runtime_info;
 }
@@ -284,228 +191,39 @@ Shader::RuntimeInfo BarycentricRuntimeInfo() {
 //     EXPECT_EQ(*result, 7.5f);
 // }
 
-TEST_F(GcnTest, interp_mov_loads_p10_from_vertex_one) {
-    const auto result = TranslateInterpMovToIr(0);
+TEST_F(GcnTest, interp_mov_uses_explicit_p10_and_p20_coefficients) {
+    const auto p10 = TranslateInterpMovToIr(0);
+    EXPECT_EQ(p10.qualifier, Shader::Qualifier::PerVertex);
+    EXPECT_EQ(p10.vertex_index, 1U);
 
-    EXPECT_EQ(result.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(result.attribute_vertex_indices, (std::vector<u32>{1}));
-    EXPECT_FALSE(result.subtraction_vertex_indices.has_value());
+    const auto p20 = TranslateInterpMovToIr(1);
+    EXPECT_EQ(p20.qualifier, Shader::Qualifier::PerVertex);
+    EXPECT_EQ(p20.vertex_index, 2U);
 }
 
-TEST_F(GcnTest, interp_mov_loads_p20_from_vertex_two) {
-    const auto result = TranslateInterpMovToIr(1);
-
-    EXPECT_EQ(result.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(result.attribute_vertex_indices, (std::vector<u32>{2}));
-    EXPECT_FALSE(result.subtraction_vertex_indices.has_value());
-}
-
-TEST_F(GcnTest, interp_mov_loads_p0_from_vertex_zero) {
-    const auto result = TranslateInterpMovToIr(2);
-
-    EXPECT_EQ(result.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(result.attribute_vertex_indices, (std::vector<u32>{0}));
-    EXPECT_FALSE(result.subtraction_vertex_indices.has_value());
-}
-
-TEST_F(GcnTest, interp_mov_loads_p0_flat_without_explicit_pervertex_support) {
-    const auto result = TranslateInterpMovToIr(2, false);
-
-    EXPECT_EQ(result.qualifier, Shader::Qualifier::Flat);
-    EXPECT_EQ(result.attribute_vertex_indices, (std::vector<u32>{0}));
-    EXPECT_FALSE(result.subtraction_vertex_indices.has_value());
-}
-
-TEST_F(GcnTest, interp_mov_uses_explicit_coefficients_for_flat_input) {
-    const auto result = TranslateInterpMovToIr(0, true, true);
-
-    EXPECT_EQ(result.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(result.attribute_vertex_indices, (std::vector<u32>{1}));
-    EXPECT_FALSE(result.subtraction_vertex_indices.has_value());
-}
-
-TEST_F(GcnTest, interp_p1_and_p2_evaluate_native_coefficients) {
-    const auto p1 = TranslateInterpStageToIr(false);
-    EXPECT_EQ(p1.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(p1.attribute_vertex_indices, (std::vector<u32>{0, 1}));
-    EXPECT_EQ(p1.fma_count, 1U);
-    EXPECT_EQ(p1.destination_write_count, 1U);
-
-    const auto p2 = TranslateInterpStageToIr(true);
-    EXPECT_EQ(p2.qualifier, Shader::Qualifier::PerVertex);
-    EXPECT_EQ(p2.attribute_vertex_indices, (std::vector<u32>{0, 2}));
-    EXPECT_EQ(p2.fma_count, 1U);
-    EXPECT_EQ(p2.destination_write_count, 1U);
-}
-
-TEST_F(GcnTest, interp_constant_and_flat_coefficients_follow_p1_p2_isa_semantics) {
-    const auto default_p1 = TranslateInterpStageToIr(false, true);
-    EXPECT_EQ(default_p1.destination_write_count, 1U);
-    EXPECT_TRUE(default_p1.attribute_vertex_indices.empty());
-    const auto default_p2 = TranslateInterpStageToIr(true, true);
-    EXPECT_EQ(default_p2.destination_write_count, 1U);
-    EXPECT_TRUE(default_p2.attribute_vertex_indices.empty());
-
-    const auto flat_p1 = TranslateInterpStageToIr(false, false, true);
-    EXPECT_EQ(flat_p1.qualifier, Shader::Qualifier::Flat);
-    EXPECT_EQ(flat_p1.destination_write_count, 1U);
-    EXPECT_EQ(flat_p1.attribute_vertex_indices, (std::vector<u32>{0}));
-    const auto flat_p2 = TranslateInterpStageToIr(true, false, true);
-    EXPECT_EQ(flat_p2.qualifier, Shader::Qualifier::Flat);
-    EXPECT_EQ(flat_p2.destination_write_count, 0U);
-    EXPECT_TRUE(flat_p2.attribute_vertex_indices.empty());
-}
-
-TEST_F(GcnTest, triangle_barycentrics_invert_radv_provoking_vertex_rotation) {
-    EXPECT_EQ(Shader::BarycentricsForProvokingVertex(0), (std::array<u32, 2>{1, 2}));
-    EXPECT_EQ(Shader::BarycentricsForProvokingVertex(1), (std::array<u32, 2>{0, 1}));
-    EXPECT_EQ(Shader::BarycentricsForProvokingVertex(2), (std::array<u32, 2>{2, 0}));
-
-    Shader::Profile profile{};
-    profile.supports_fragment_shader_barycentric = true;
-    profile.supports_provoking_vertex = true;
-    Shader::RuntimeInfo runtime_info{};
-    runtime_info.Initialize(Shader::Stage::Fragment);
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::TriangleList;
-    runtime_info.fs_info.provoking_vtx_last = true;
-
-    const auto mapping = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(mapping.even, (std::array<u32, 2>{2, 0}));
-    EXPECT_EQ(mapping.odd, mapping.even);
-    EXPECT_FALSE(mapping.uses_primitive_parity);
-}
-
-TEST_F(GcnTest, triangle_strip_barycentrics_follow_host_vertex_order_property) {
-    Shader::Profile profile{};
-    profile.supports_fragment_shader_barycentric = true;
-    profile.supports_provoking_vertex = true;
-    profile.tri_strip_vertex_order_independent_of_provoking_vertex = true;
-    Shader::RuntimeInfo runtime_info{};
-    runtime_info.Initialize(Shader::Stage::Fragment);
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::TriangleStrip;
-    runtime_info.fs_info.provoking_vtx_last = true;
-
-    const auto mapping = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(mapping.even, (std::array<u32, 2>{2, 0}));
-    EXPECT_EQ(mapping.odd, (std::array<u32, 2>{0, 1}));
-    EXPECT_TRUE(mapping.uses_primitive_parity);
-
-    profile.tri_strip_vertex_order_independent_of_provoking_vertex = false;
-    const auto reordered = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(reordered.even, (std::array<u32, 2>{2, 0}));
-    EXPECT_EQ(reordered.odd, reordered.even);
-    EXPECT_FALSE(reordered.uses_primitive_parity);
-}
-
-TEST_F(GcnTest, barycentric_mapping_handles_missing_host_last_provoking_support) {
-    Shader::Profile profile{};
-    profile.supports_fragment_shader_barycentric = true;
-    Shader::RuntimeInfo runtime_info{};
-    runtime_info.Initialize(Shader::Stage::Fragment);
-    runtime_info.fs_info.provoking_vtx_last = true;
-
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::TriangleFan;
-    const auto fan = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(fan.even, (std::array<u32, 2>{0, 1}));
-    EXPECT_FALSE(fan.uses_primitive_parity);
-
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::TriangleStrip;
-    const auto strip = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(strip.even, (std::array<u32, 2>{2, 0}));
-    EXPECT_EQ(strip.odd, (std::array<u32, 2>{0, 1}));
-    EXPECT_TRUE(strip.uses_primitive_parity);
-
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::LineList;
-    const auto line = Shader::GetFragmentBarycentricMapping(runtime_info, profile);
-    EXPECT_EQ(line.even, (std::array<u32, 2>{1, 2}));
-    EXPECT_FALSE(line.uses_primitive_parity);
-}
-
-TEST_F(GcnTest, khr_barycentrics_use_interpolation_functions_per_evaluation_mode) {
+TEST_F(GcnTest, khr_barycentrics_reconstruct_pull_model) {
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010600;
     profile.supports_fragment_shader_barycentric = true;
-    const auto spirv = TranslateFragmentBarycentricsToSpirv(profile, BarycentricRuntimeInfo());
+    const auto spirv = TranslateFragmentPullModelToSpirv(profile, PullModelRuntimeInfo());
     const auto facts = InspectSpirv(spirv);
 
     EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordKHR), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordNoPerspKHR), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::SampleId), 1U);
     EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::FragCoord), 1U);
-    EXPECT_EQ(facts.CountDecoration(spv::Decoration::Centroid), 0U);
-    EXPECT_EQ(facts.CountDecoration(spv::Decoration::Sample), 0U);
     EXPECT_EQ(facts.CountCapability(spv::Capability::FragmentBarycentricKHR), 1U);
-    EXPECT_EQ(facts.CountCapability(spv::Capability::InterpolationFunction), 1U);
-    EXPECT_EQ(facts.CountCapability(spv::Capability::SampleRateShading), 1U);
     EXPECT_EQ(facts.CountOpcode(spv::Op::OpFMul), 2U);
 }
 
-TEST_F(GcnTest, amd_barycentrics_use_all_native_builtins) {
+TEST_F(GcnTest, amd_barycentrics_use_native_pull_model) {
     Shader::Profile profile{};
     profile.supported_spirv = 0x00010600;
     profile.supports_amd_shader_explicit_vertex_parameter = true;
-    const auto spirv = TranslateFragmentBarycentricsToSpirv(profile, BarycentricRuntimeInfo());
+    const auto spirv = TranslateFragmentPullModelToSpirv(profile, PullModelRuntimeInfo());
     const auto facts = InspectSpirv(spirv);
 
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordSmoothAMD), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordSmoothCentroidAMD), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordSmoothSampleAMD), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordNoPerspAMD), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordNoPerspCentroidAMD), 1U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordNoPerspSampleAMD), 1U);
     EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::BaryCoordPullModelAMD), 1U);
     EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::FragCoord), 0U);
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::SampleId), 0U);
-    EXPECT_EQ(facts.CountCapability(spv::Capability::SampleRateShading), 1U);
     EXPECT_EQ(facts.CountOpcode(spv::Op::OpFMul), 0U);
-}
-
-TEST_F(GcnTest, khr_and_amd_support_scalar_pervertex_parameters) {
-    auto runtime_info = BarycentricRuntimeInfo();
-    runtime_info.fs_info.num_inputs = 1;
-    runtime_info.fs_info.inputs[0].param_index = 0;
-
-    Shader::Profile khr_profile{};
-    khr_profile.supported_spirv = 0x00010600;
-    khr_profile.supports_fragment_shader_barycentric = true;
-    const auto khr_facts =
-        InspectSpirv(TranslateFragmentScalarPerVertexToSpirv(khr_profile, runtime_info));
-    EXPECT_EQ(khr_facts.CountCapability(spv::Capability::FragmentBarycentricKHR), 1U);
-
-    Shader::Profile amd_profile{};
-    amd_profile.supported_spirv = 0x00010600;
-    amd_profile.supports_amd_shader_explicit_vertex_parameter = true;
-    const auto amd_facts =
-        InspectSpirv(TranslateFragmentScalarPerVertexToSpirv(amd_profile, runtime_info));
-    EXPECT_EQ(amd_facts.CountCapability(spv::Capability::InterpolationFunction), 1U);
-}
-
-TEST_F(GcnTest, khr_barycentrics_need_no_primitive_order_remap) {
-    Shader::Profile profile{};
-    profile.supported_spirv = 0x00010600;
-    profile.supports_fragment_shader_barycentric = true;
-
-    const auto facts =
-        InspectSpirv(TranslateFragmentBarycentricsToSpirv(profile, BarycentricRuntimeInfo()));
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::PrimitiveId), 0U);
-    EXPECT_EQ(facts.CountCapability(spv::Capability::Geometry), 0U);
-    EXPECT_EQ(facts.CountOpcode(spv::Op::OpSelect), 0U);
-}
-
-TEST_F(GcnTest, khr_odd_strip_barycentrics_select_by_primitive_parity) {
-    Shader::Profile profile{};
-    profile.supported_spirv = 0x00010600;
-    profile.supports_fragment_shader_barycentric = true;
-    profile.supports_provoking_vertex = true;
-    profile.tri_strip_vertex_order_independent_of_provoking_vertex = true;
-    auto runtime_info = BarycentricRuntimeInfo();
-    runtime_info.fs_info.primitive_type = AmdGpu::PrimitiveType::TriangleStrip;
-    runtime_info.fs_info.provoking_vtx_last = true;
-
-    const auto facts = InspectSpirv(TranslateFragmentBarycentricsToSpirv(profile, runtime_info));
-    EXPECT_EQ(facts.CountBuiltin(spv::BuiltIn::PrimitiveId), 1U);
-    EXPECT_EQ(facts.CountCapability(spv::Capability::Geometry), 1U);
-    EXPECT_GT(facts.CountOpcode(spv::Op::OpSelect), 0U);
 }
 
 TEST_F(GcnTest, fragment_front_face_uses_float_sign_bits) {

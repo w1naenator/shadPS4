@@ -15,11 +15,9 @@ struct RuntimeInfo;
 
 std::vector<u32> TranslateToSpirv(u64 raw_gcn_inst);
 std::vector<u32> TranslateToSpirv(std::span<const u64> raw_gcn_insts);
-std::vector<u32> TranslateFragmentBarycentricsToSpirv(const Shader::Profile& profile,
-                                                      const Shader::RuntimeInfo& runtime_info);
+std::vector<u32> TranslateFragmentPullModelToSpirv(const Shader::Profile& profile,
+                                                   const Shader::RuntimeInfo& runtime_info);
 std::vector<u32> TranslateFragmentFrontFaceToSpirv(const Shader::Profile& profile,
                                                    const Shader::RuntimeInfo& runtime_info);
 std::vector<u32> TranslateFragmentSampleCoverageToSpirv(const Shader::Profile& profile,
                                                         const Shader::RuntimeInfo& runtime_info);
-std::vector<u32> TranslateFragmentScalarPerVertexToSpirv(const Shader::Profile& profile,
-                                                         const Shader::RuntimeInfo& runtime_info);

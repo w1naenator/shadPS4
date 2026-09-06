@@ -492,6 +492,15 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         !info.images.empty()) {
         return false;
     }
+    const bool is_formatted_copy =
+        info.buffers.size() == 2 &&
+        std::ranges::all_of(info.buffers, &Shader::BufferResource::is_formatted);
+    const bool is_bounded_raw_copy =
+        info.buffers.size() == 3 &&
+        std::ranges::none_of(info.buffers, &Shader::BufferResource::is_formatted);
+    if (!is_formatted_copy && !is_bounded_raw_copy) {
+        return false;
+    }
 
     const Shader::BufferResource* dst_desc{};
     for (const auto& desc : info.buffers) {
