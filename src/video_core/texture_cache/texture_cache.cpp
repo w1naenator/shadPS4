@@ -282,9 +282,17 @@ std::tuple<ImageId, int, int> TextureCache::ResolveOverlap(const ImageInfo& imag
             return {ExpandImage(image_info, cache_image_id), -1, -1};
         }
 
+        const bool pow2_padding_only =
+            image_info.props.is_pow2 != cache_image.info.props.is_pow2 &&
+            image_info.tile_mode == cache_image.info.tile_mode &&
+            image_info.size == cache_image.info.size &&
+            image_info.pitch == cache_image.info.pitch && image_info.resources.levels == 1 &&
+            cache_image.info.resources.levels == 1 && image_info.resources.layers == 1 &&
+            cache_image.info.resources.layers == 1;
+
         // Size and resources are less than or equal, use image view.
         if (image_info.pixel_format != cache_image.info.pixel_format ||
-            image_info.guest_size <= cache_image.info.guest_size) {
+            image_info.guest_size <= cache_image.info.guest_size || pow2_padding_only) {
             auto result_id = merged_image_id ? merged_image_id : cache_image_id;
             const auto& result_image = slot_images[result_id];
             const bool is_compatible =
@@ -833,7 +841,7 @@ void TextureCache::TrackImage(ImageId image_id) {
         // Re-track the whole image
         image.track_addr = image_begin;
         image.track_addr_end = image_end;
-        tracker.UpdatePageWatchers<1>(image_begin, image.info.guest_size);
+        tracker.UpdatePageWatchers(image_begin, image.info.guest_size, PageOp::Track);
     } else {
         if (image_begin < image.track_addr) {
             TrackImageHead(image_id);
@@ -856,7 +864,7 @@ void TextureCache::TrackImageHead(ImageId image_id) {
     ASSERT(image.track_addr != 0 && image_begin < image.track_addr);
     const auto size = image.track_addr - image_begin;
     image.track_addr = image_begin;
-    tracker.UpdatePageWatchers<1>(image_begin, size);
+    tracker.UpdatePageWatchers(image_begin, size, PageOp::Track);
 }
 
 void TextureCache::TrackImageTail(ImageId image_id) {
@@ -872,7 +880,7 @@ void TextureCache::TrackImageTail(ImageId image_id) {
     const auto addr = image.track_addr_end;
     const auto size = image_end - image.track_addr_end;
     image.track_addr_end = image_end;
-    tracker.UpdatePageWatchers<1>(addr, size);
+    tracker.UpdatePageWatchers(addr, size, PageOp::Track);
 }
 
 void TextureCache::UntrackImage(ImageId image_id) {
@@ -885,7 +893,7 @@ void TextureCache::UntrackImage(ImageId image_id) {
     image.track_addr = 0;
     image.track_addr_end = 0;
     if (size != 0) {
-        tracker.UpdatePageWatchers<false>(addr, size);
+        tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
     }
 }
 
@@ -904,7 +912,7 @@ void TextureCache::UntrackImageHead(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(image_begin, size);
+    tracker.UpdatePageWatchers(image_begin, size, PageOp::Untrack);
 }
 
 void TextureCache::UntrackImageTail(ImageId image_id) {
@@ -923,7 +931,7 @@ void TextureCache::UntrackImageTail(ImageId image_id) {
         // Cehck its hash later.
         MarkAsMaybeDirty(image_id, image);
     }
-    tracker.UpdatePageWatchers<false>(addr, size);
+    tracker.UpdatePageWatchers(addr, size, PageOp::Untrack);
 }
 
 void TextureCache::GarbageCollectImages() {
