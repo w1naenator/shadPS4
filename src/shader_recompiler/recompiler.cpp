@@ -116,6 +116,7 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::LowerUserClipPlanes(program, runtime_info);
     Shader::Optimization::PhiSimplificationPass(program);
     Shader::Optimization::InverseBallotEliminationPass(program);
+    Shader::Optimization::LowerComputeMaskedBitCount(program);
     Shader::IR::DumpProgram(program, info, "pre-lower-phi.");
 
     // Prepare for structurization by clearing flow graph and lowering phis
@@ -136,7 +137,6 @@ IR::Program TranslateProgram(const std::span<const u32>& code, Pools& pools, Inf
     Shader::Optimization::SsaRewritePass(program);
     Shader::Optimization::SharedMemoryBarrierPass(program, runtime_info, profile);
     Shader::Optimization::DeadCodeEliminationPass(program);
-    Shader::Optimization::LowerWave64BallotPass(program, runtime_info, profile);
     Shader::Optimization::LowerHardwareIntrinsics(program);
     Shader::Optimization::ConstantPropagationPass(program.post_order_blocks);
     Shader::Optimization::DeadCodeEliminationPass(program);

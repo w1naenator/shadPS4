@@ -72,8 +72,6 @@ static void Lower(IR::Block& block, IR::Inst& inst) {
         return LowerCmpClass(block, inst);
     case IR::Opcode::BitFieldUExtract:
         return LowerPackedAncillary(block, inst);
-    case IR::Opcode::MaskedBitCount32:
-        return LowerMaskedBitCount(block, inst);
     default:
         break;
     }
@@ -83,6 +81,19 @@ void LowerHardwareIntrinsics(IR::Program& program) {
     for (IR::Block* const block : program.blocks) {
         for (IR::Inst& inst : block->Instructions()) {
             Lower(*block, inst);
+        }
+    }
+}
+
+void LowerComputeMaskedBitCount(IR::Program& program) {
+    if (program.info.hw_stage != HwStage::Compute) {
+        return;
+    }
+    for (IR::Block* const block : program.blocks) {
+        for (IR::Inst& inst : block->Instructions()) {
+            if (inst.GetOpcode() == IR::Opcode::MaskedBitCount32) {
+                LowerMaskedBitCount(*block, inst);
+            }
         }
     }
 }
