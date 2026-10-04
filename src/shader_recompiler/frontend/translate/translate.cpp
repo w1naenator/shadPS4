@@ -973,11 +973,7 @@ void Translator::SetDst(const InstOperand& operand, const IR::U32F32& value) {
             result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
         }
         if (operand.output_modifier.clamp) {
-            if (runtime_info.props.dx10_clamp) {
-                result = ir.FPSaturate(result);
-            } else {
-                result = ir.FPClamp(result, ir.Imm32(0.f), ir.Imm32(1.f));
-            }
+            result = ir.FPSaturate(result);
         }
     }
 
@@ -1005,11 +1001,7 @@ void Translator::SetDst16(const InstOperand& operand, const IR::U32F32& value) {
             result = ir.FPMul(result, ir.Imm32(operand.output_modifier.multiplier));
         }
         if (operand.output_modifier.clamp) {
-            if (runtime_info.props.dx10_clamp) {
-                result = ir.FPSaturate(result);
-            } else {
-                result = ir.FPClamp(result, ir.Imm32(0.f), ir.Imm32(1.f));
-            }
+            result = ir.FPSaturate(result);
         }
     } else {
         if (operand.output_modifier.clamp) {
@@ -1066,11 +1058,7 @@ void Translator::SetDst64(const InstOperand& operand, const IR::U64F64& value_ra
                 ir.FPMul(value_untyped, ir.Imm64(f64(operand.output_modifier.multiplier)));
         }
         if (operand.output_modifier.clamp) {
-            if (runtime_info.props.dx10_clamp) {
-                value_untyped = ir.FPSaturate(value_untyped);
-            } else {
-                value_untyped = ir.FPClamp(value_untyped, ir.Imm32(0.f), ir.Imm32(1.f));
-            }
+            value_untyped = ir.FPSaturate(value_untyped);
         }
     }
 
@@ -1114,12 +1102,7 @@ void Translator::SetDstPk(const InstOperand& operand, const pk_type<T>& value) {
 
     if constexpr (std::is_same_v<T, IR::F32>) {
         if (operand.output_modifier.clamp) {
-            if (runtime_info.props.dx10_clamp) {
-                v = {ir.FPSaturate(v.first), ir.FPSaturate(v.second)};
-            } else {
-                v = {ir.FPClamp(v.first, ir.Imm32(0.f), ir.Imm32(1.f)),
-                     ir.FPClamp(v.second, ir.Imm32(0.f), ir.Imm32(1.f))};
-            }
+            v = {ir.FPSaturate(v.first), ir.FPSaturate(v.second)};
         }
     } else {
         if (operand.output_modifier.clamp) {
