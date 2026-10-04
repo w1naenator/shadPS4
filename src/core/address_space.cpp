@@ -15,6 +15,7 @@
 #include "libraries/error_codes.h"
 
 #ifdef _WIN32
+#include <boost/icl/interval_map.hpp>
 #include <windows.h>
 #else
 #include <fcntl.h>
@@ -289,6 +290,20 @@ struct AddressSpace::Impl {
                               MEM_RESERVE | MEM_COMMIT | MEM_REPLACE_PLACEHOLDER, prot, nullptr, 0);
         }
         ASSERT_MSG(ptr, "{}", Common::GetLastErrorMsg());
+        using Interval = decltype(page_protections)::interval_type;
+        const auto range = Interval::right_open(virtual_addr, virtual_addr + size);
+        for (auto it = page_protections.lower_bound(range);
+             it != page_protections.end() && it->first.lower() < virtual_addr + size; ++it) {
+            if (it->second == prot) {
+                continue;
+            }
+            const VAddr begin = std::max(virtual_addr, it->first.lower());
+            const VAddr end = std::min(virtual_addr + size, it->first.upper());
+            DWORD old_flags{};
+            ASSERT_MSG(VirtualProtectEx(process, reinterpret_cast<void*>(begin), end - begin,
+                                        it->second, &old_flags),
+                       "Failed to restore mapping protection: {}", Common::GetLastErrorMsg());
+        }
         return ptr;
     }
 
@@ -468,6 +483,8 @@ struct AddressSpace::Impl {
 
     VAddr Unmap(VAddr virtual_addr, u64* size) {
         std::scoped_lock lk{mutex};
+        page_protections.erase(decltype(page_protections)::interval_type::right_open(
+            virtual_addr, virtual_addr + *size));
         // Loop through all regions in the requested range
         u64 remaining_size = *size;
         VAddr current_addr = virtual_addr;
@@ -564,6 +581,9 @@ struct AddressSpace::Impl {
                     "{:#x}, error {}",
                     virtual_addr, size, Common::GetLastErrorMsg());
             }
+            page_protections.set({decltype(page_protections)::interval_type::right_open(
+                                      range_addr, range_addr + range_size),
+                                  new_flags});
         }
     }
 
@@ -587,6 +607,7 @@ struct AddressSpace::Impl {
     u8* user_base{};
     u64 user_size{};
     std::map<VAddr, MemoryRegion> regions;
+    boost::icl::interval_map<VAddr, ULONG> page_protections;
 };
 #else
 
