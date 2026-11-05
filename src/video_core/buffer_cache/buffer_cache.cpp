@@ -140,7 +140,7 @@ void BufferCache::ReadMemory(VAddr device_addr, u64 size, bool is_write, bool as
 
         // GPU-modified ranges come as many small scattered islands,
         // so the download is widened to a window around the request
-        constexpr u64 WindowSize = 512_KB;
+        constexpr u64 WindowSize = 128_KB;
         const VAddr arena_end = arena->cpu_addr + arena->size_bytes;
         const VAddr window_start =
             std::max<VAddr>(Common::AlignDown(device_addr, WindowSize), arena->cpu_addr);
