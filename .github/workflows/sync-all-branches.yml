@@ -1,0 +1,62 @@
+name: Sync All Branches
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Sync matching branches
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORK: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          UPSTREAM=$(gh api "repos/$FORK" --jq '.parent.full_name')
+
+          if [ -z "$UPSTREAM" ] || [ "$UPSTREAM" = "null" ]; then
+            echo "Repository is not a fork"
+            exit 1
+          fi
+
+          git init sync-repo
+          cd sync-repo
+
+          git remote add fork \
+            "https://x-access-token:${GH_TOKEN}@github.com/${FORK}.git"
+          git remote add upstream \
+            "https://github.com/${UPSTREAM}.git"
+
+          git fetch fork '+refs/heads/*:refs/remotes/fork/*'
+          git fetch upstream '+refs/heads/*:refs/remotes/upstream/*'
+
+          while IFS= read -r branch; do
+            if ! git show-ref --verify --quiet \
+              "refs/remotes/fork/$branch"; then
+              echo "SKIP $branch: not in fork"
+              continue
+            fi
+
+            old=$(git rev-parse "refs/remotes/fork/$branch")
+            new=$(git rev-parse "refs/remotes/upstream/$branch")
+
+            if [ "$old" = "$new" ]; then
+              echo "OK $branch: already synced"
+            elif git merge-base --is-ancestor "$old" "$new"; then
+              echo "SYNC $branch"
+              git push fork "$new:refs/heads/$branch"
+            else
+              echo "SKIP $branch: diverged"
+            fi
+          done < <(
+            git for-each-ref \
+              --format='%(refname:strip=3)' \
+              refs/remotes/upstream/
+          )
+          
