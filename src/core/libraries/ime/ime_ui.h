@@ -4,6 +4,7 @@
 #pragma once
 
 #include <mutex>
+#include <string>
 #include <imgui.h>
 #include <queue>
 #include "imgui/imgui_layer.h"
@@ -30,19 +31,35 @@ class ImeState {
 
     // A character can hold up to 4 bytes in UTF-8
     Common::CString<ORBIS_IME_MAX_TEXT_LENGTH * 4 + 1> current_text;
+    std::u16string reported_text;
+    u32 reported_caret_index = 0;
+    u64 text_revision = 0;
+    OrbisImePositionAndForm panel_layout{};
+    OrbisImeCaret caret_geometry{};
+    std::array<OrbisImeTextGeometry, 4> text_geometry{};
+    u32 selection_index = 0;
+    u32 selection_length = 0;
     int caret_index = 0;
     int caret_byte_index = 0;
     bool caret_dirty = false;
+    bool geometry_dirty = false;
 
-    std::queue<OrbisImeEvent> event_queue;
+    struct QueuedEvent {
+        OrbisImeEvent event;
+        std::u16string text;
+        bool text_edit;
+        u64 revision;
+    };
+    std::queue<QueuedEvent> event_queue;
     std::mutex queue_mutex;
 
 public:
-    ImeState(const OrbisImeParam* param = nullptr, const OrbisImeParamExtended* extended = nullptr);
+    ImeState() = default;
+    ImeState(const OrbisImeParam* param, const OrbisImeParamExtended* extended = nullptr);
     ImeState(ImeState&& other) noexcept;
     ImeState& operator=(ImeState&& other) noexcept;
 
-    void SendEvent(OrbisImeEvent* event);
+    void SendEvent(OrbisImeEvent* event, bool text_edit = true);
     void SendEnterEvent();
     void SendCloseEvent();
 
@@ -57,6 +74,7 @@ private:
 };
 
 class ImeUi : public ImGui::Layer {
+    friend class ImeHandler;
     enum class PanelSelectionTarget : u8 {
         Input = 0,
         Prediction = 1,
@@ -71,6 +89,8 @@ class ImeUi : public ImGui::Layer {
     };
 
     ImeState* state{};
+    OrbisImeParam ime_param_storage{};
+    OrbisImeParamExtended extended_param_storage{};
     const OrbisImeParam* ime_param{};
     const OrbisImeParamExtended* extended_param{};
     ImeStyleConfig style_config{};
@@ -78,6 +98,11 @@ class ImeUi : public ImGui::Layer {
     bool first_render = true;
     bool accept_armed = false;
     bool native_input_active = false;
+    bool native_accept_pressed = false;
+    bool native_newline_pressed = false;
+    int preferred_caret_column = -1;
+    std::u16string last_input_text;
+    int last_input_caret = -1;
     bool pointer_navigation_active = true;
     EditMenuPopup edit_menu_popup = EditMenuPopup::None;
     bool menu_activate_armed = true;
@@ -132,7 +157,7 @@ class ImeUi : public ImGui::Layer {
     ImeKbLayoutSelection last_nav_layout_selection{};
     bool nav_layout_selection_initialized = false;
     ImeKbLayoutFamily kb_alpha_family = ImeKbLayoutFamily::Latin;
-    std::mutex draw_mutex;
+    std::recursive_mutex draw_mutex;
 
 public:
     explicit ImeUi(ImeState* state = nullptr, const OrbisImeParam* param = nullptr,
@@ -142,6 +167,7 @@ public:
     ImeUi& operator=(ImeUi&& other);
 
     void Draw() override;
+    void DisableController();
 
 private:
     void Free();

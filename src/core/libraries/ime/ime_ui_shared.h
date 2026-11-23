@@ -5,6 +5,7 @@
 
 #include <algorithm>
 #include <array>
+#include <string>
 #include <imgui_internal.h>
 
 #include "common/types.h"
@@ -30,11 +31,21 @@ constexpr float kSelectorPressPulseExpandBorderFactor = 1.0f;
 ImVec4 BrightenColor(ImU32 color, float delta);
 int Utf16CountFromUtf8Range(const char* text, const char* end = nullptr);
 int Utf8ByteIndexFromUtf16Index(const char* text, int utf16_index);
+int MoveImeCaretByLine(const char* text, int caret_utf16, int direction, int& preferred_column);
+bool IsImeCharacterAllowed(unsigned int character, OrbisImeType type);
+std::string BoundImeInsertion(const char* text, int max_utf16, bool multiline, bool numeric,
+                              OrbisImeType type = OrbisImeType::Default);
+bool DrawImeInputText(const char* label, const char* hint, char* buffer, int capacity,
+                      const ImVec2& size, ImGuiInputTextFlags flags,
+                      ImGuiInputTextCallback callback, void* userdata, bool password,
+                      bool disable_clipboard);
+bool FilterImeText(OrbisImeTextFilter filter, std::u16string& text, u32 max_length, u32& caret);
+void InsertImeInputNewline(ImGuiInputTextCallbackData* data, int max_utf16);
 bool RejectInputCharByUtf16Limit(const ImGuiInputTextCallbackData* data, int max_utf16);
 bool ClampInputBufferToUtf16Limit(ImGuiInputTextCallbackData* data, int max_utf16);
-void DrawInactiveCaretOverlay(const ImRect& frame_rect, const char* text, int caret_byte,
-                              int selection_start_byte, int selection_end_byte,
-                              bool multiline = false);
+void DrawInactiveCaretOverlay(ImGuiID input_id, const ImRect& frame_rect, const char* text,
+                              int caret_byte, int selection_start_byte, int selection_end_byte,
+                              bool multiline = false, bool password = false);
 
 struct SelectorFadeState {
     ImVec2 current_min{};
@@ -60,7 +71,10 @@ void DrawSelectorFadeState(const SelectorFadeState& state, ImDrawList* draw_list
                            float fade_duration_sec, double now, float current_expand_px = 0.0f);
 
 ImeKbLayoutSelection ResolveInitialKbLayoutSelection(OrbisImeExtOption ext_option,
-                                                     OrbisImePanelPriority panel_priority);
+                                                     OrbisImePanelPriority panel_priority,
+                                                     OrbisImeLanguage supported_languages,
+                                                     OrbisImeType type = OrbisImeType::Default);
+void NotifyImeKeyboardLayoutFallback(OrbisImeLanguage supported_languages, OrbisImeType type);
 void InitializeDefaultOskSelectionAnchor(const ImeKbLayoutSelection& layout_selection,
                                          OrbisImeExtOption ext_option, int& pending_row,
                                          int& pending_col, int& last_row, int& last_col);
